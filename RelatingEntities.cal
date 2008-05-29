@@ -1,0 +1,169 @@
+-- Copyright (c) 2008 Stephen C. Harris.
+-- See COPYING file at the root of this distribution for copyright information.
+
+/*
+ * RelatingEntities.cal
+ * Creation date: Sep 6, 2007.
+ * By: Stephen C. Harris, reachable on gmail.com as steveOfAR
+ */
+
+
+/**
+ * Defines CAL functions for finding paths of foreign key links between tables in a given context, and for generating
+ * {@link typeConstructor = MappedQuery@}'s representing joins along such paths with the tail end table projected.
+ * 
+ * @author Stephen C. Harris, reachable on gmail.com as steveOfAR
+ */
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+module NCTR.Cal.Data.RelatingEntities;
+
+import Cal.Core.Prelude using
+    function = concat, equals, fromJust, fst, isEmpty, snd;
+    dataConstructor = Cons, True;
+    typeConstructor = String;
+    typeClass = Typeable;
+    ;
+import Cal.Core.Dynamic using
+    typeConstructor = Dynamic;
+    function = fromDynamic;
+    ;
+import Cal.Data.DatabaseMetadata using
+    typeConstructor = TableReference;
+    ;
+import Cal.Collections.List using
+    function =
+        concatMap, delete, deleteBy, filter, foldLeft, foldLeftStrict, head,
+        intersperse, map, tail;
+    ;
+
+
+import NCTR.Cal.Data.ForeignKeys using
+    typeConstructor = ForeignKeyLink, MappedForeignKeyLink;
+    function =
+        foreignKeyLinkFromMapped, leftTable, leftTableOfMappedLink,
+        matchedFieldsOfLink, rightTable, rightTableOfMappedLink, showLink;
+    dataConstructor = ManyToOne, OneToMany;
+    ;
+
+import NCTR.Cal.Utils.Strings using
+    function = listAsString;
+    ;
+
+import NCTR.Cal.Data.MappedQueries using
+    typeConstructor = MappedQuery;
+    function =
+        innerJoinProjectRight, makeInnerJoin, makeInnerJoinProjectRight,
+        withRowValuePostProcessor;
+    ;
+
+import Cal.Core.Debug using
+    function = show;
+    ;
+
+linksFromTableInContext :: TableReference -> [MappedForeignKeyLink Dynamic Dynamic] -> [MappedForeignKeyLink Dynamic Dynamic];
+public linksFromTableInContext !table !contextLinks = 
+    filter (equals table # leftTableOfMappedLink) contextLinks;
+
+
+
+// A PathsFilter is used to filter out unwanted paths.  It acts on the entire list of possible paths and not individual paths
+// as a predicate, in order to allow e.g. choosing only the shortest paths.
+data public PathsFilter =
+    
+    public NoPathsFilter |
+    
+    public PathsFilter 
+        filterFun :: ([[MappedForeignKeyLink Dynamic Dynamic]] -> [[MappedForeignKeyLink Dynamic Dynamic]])
+    ;
+
+defaultPathsFilter :: PathsFilter;
+defaultPathsFilter =
+    let 
+        hasNoRepeatedTables !path =
+            if isEmpty path then
+                True
+            else
+                let 
+                    tables = (leftTableOfMappedLink $ head path) : map rightTableOfMappedLink path;
+                in
+                    List.length tables == (List.length $ List.removeDuplicates tables);
+    in
+        PathsFilter (List.filter hasNoRepeatedTables);
+
+
+
+
+
+pathsFromToInContext :: TableReference -> TableReference -> [MappedForeignKeyLink Dynamic Dynamic] -> [[MappedForeignKeyLink Dynamic Dynamic]];
+public pathsFromToInContext !startTable !endTable !contextLinks =
+   filteredPathsFromToInContext defaultPathsFilter startTable endTable contextLinks;
+
+
+shortestPathsFromToInContext :: TableReference -> TableReference -> [MappedForeignKeyLink Dynamic Dynamic] -> [[MappedForeignKeyLink Dynamic Dynamic]];
+public shortestPathsFromToInContext = 
+    let
+        shortestPaths !paths = 
+            let
+                minPathLen = List.minimum $ map List.length paths;
+            in
+                List.filter (equals minPathLen # List.length) paths;
+    in
+        filteredPathsFromToInContext (PathsFilter shortestPaths);
+
+
+filteredPathsFromToInContext :: PathsFilter -> TableReference -> TableReference -> [MappedForeignKeyLink Dynamic Dynamic] -> [[MappedForeignKeyLink Dynamic Dynamic]];
+public filteredPathsFromToInContext !pathsFilter !startTable !endTable !contextLinks =
+    let
+        initialLinks = linksFromTableInContext startTable contextLinks;
+        
+        pathsStartingWith !initLink =
+            if rightTableOfMappedLink initLink == endTable then
+                [[initLink]] // no passing through end table allowed.
+            else
+                map (Cons initLink)
+                    (filteredPathsFromToInContext
+                         pathsFilter
+                         (rightTableOfMappedLink initLink)
+                         endTable
+                         (deleteBy sameFk initLink contextLinks)); // remove link from context for the rest of the path
+                sameFk !mfkl1 !mfkl2 = foreignKeyLinkFromMapped mfkl1 == foreignKeyLinkFromMapped mfkl2;
+        
+        allPaths = concatMap pathsStartingWith initialLinks; 
+    in
+        case pathsFilter of
+                
+        NoPathsFilter -> allPaths;
+                
+        PathsFilter {filterFun} -> filterFun allPaths;
+    ;
+
+
+showPath:: [MappedForeignKeyLink Dynamic Dynamic] -> String;
+public showPath !path =
+    let
+        showLinkWithoutLeftTable :: ForeignKeyLink -> String;
+        showLinkWithoutLeftTable !fkl = 
+            case fkl of 
+            ManyToOne {} -> ">--" ++ show (map fst $ matchedFieldsOfLink fkl) ++ "-- " ++ show (rightTable fkl); 
+            OneToMany {} -> "--"  ++ show (map snd $ matchedFieldsOfLink fkl) ++ "--< " ++ show (rightTable fkl);
+            ;
+    in
+        if isEmpty path then
+            ""
+        else
+            showLink (foreignKeyLinkFromMapped $ head path) ++ " "
+            ++ listAsString (showLinkWithoutLeftTable # foreignKeyLinkFromMapped) " " (tail path);
+
+innerJoinPathProjectingLastTableAsDynamic :: [MappedForeignKeyLink Dynamic Dynamic] ->  MappedQuery Dynamic Dynamic Dynamic;
+public innerJoinPathProjectingLastTableAsDynamic !path =
+    foldLeftStrict innerJoinProjectRight (makeInnerJoinProjectRight $ head path) (tail path);
+
+innerJoinPathProjectingLastTable :: (Typeable a) => [MappedForeignKeyLink Dynamic Dynamic] ->  MappedQuery Dynamic Dynamic a;
+public innerJoinPathProjectingLastTable !path =
+    withRowValuePostProcessor (fromJust # fromDynamic) $
+        innerJoinPathProjectingLastTableAsDynamic path;
+
+
+
